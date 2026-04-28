@@ -1,6 +1,3 @@
-// 각 지수의 역사적 PER 범위 (장기 데이터 기반)
-// symbol: 가격/등락률용 (지수 심볼)
-// peSymbol: PER용 (ETF 심볼 - 지수 심볼은 PER 데이터 미제공)
 const INDICES = [
   {
     id: "sp500",
@@ -8,7 +5,6 @@ const INDICES = [
     symbol: "^GSPC",
     peSymbol: "SPY",
     flag: "🇺🇸",
-    region: "미국",
     historicalAvg: 17,
     ranges: { undervalued: 18, fair: 25, overvalued: 32 },
     description: "미국 대형주 500개",
@@ -19,7 +15,6 @@ const INDICES = [
     symbol: "^NDX",
     peSymbol: "QQQ",
     flag: "🇺🇸",
-    region: "미국",
     historicalAvg: 25,
     ranges: { undervalued: 22, fair: 33, overvalued: 42 },
     description: "미국 기술주 중심 100개",
@@ -30,7 +25,6 @@ const INDICES = [
     symbol: "^KS11",
     peSymbol: "EWY",
     flag: "🇰🇷",
-    region: "한국",
     historicalAvg: 11,
     ranges: { undervalued: 10, fair: 15, overvalued: 20 },
     description: "한국 대표 지수 (코스피 기준)",
@@ -41,7 +35,6 @@ const INDICES = [
     symbol: "000300.SS",
     peSymbol: "ASHR",
     flag: "🇨🇳",
-    region: "중국",
     historicalAvg: 13,
     ranges: { undervalued: 12, fair: 18, overvalued: 25 },
     description: "중국 상하이/선전 대형주 300개",
@@ -54,33 +47,45 @@ const HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
 };
 
+// 가격: 지수 심볼로 조회
 async function fetchPrice(symbol) {
-  const encoded = encodeURIComponent(symbol);
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encoded}?interval=1d&range=1d`;
-  const res = await fetch(url, { headers: HEADERS }).catch(() => null);
-  if (!res?.ok) return { price: null, changePercent: null };
-
-  const data = await res.json().catch(() => null);
-  const meta = data?.chart?.result?.[0]?.meta;
-  if (!meta) return { price: null, changePercent: null };
-
-  const price = meta.regularMarketPrice ?? null;
-  const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? null;
-  const changePercent = price && prevClose ? ((price - prevClose) / prevClose) * 100 : null;
-  return { price, changePercent };
+  try {
+    const encoded = encodeURIComponent(symbol);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encoded}?interval=1d&range=1d`;
+    const res = await fetch(url, { headers: HEADERS });
+    if (!res.ok) return { price: null, changePercent: null };
+    const data = await res.json();
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (!meta) return { price: null, changePercent: null };
+    const price = meta.regularMarketPrice ?? null;
+    const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? null;
+    const changePercent = price && prevClose ? ((price - prevClose) / prevClose) * 100 : null;
+    return { price, changePercent };
+  } catch {
+    return { price: null, changePercent: null };
+  }
 }
 
-async function fetchPE(peSymbol) {
-  const encoded = encodeURIComponent(peSymbol);
-  const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encoded}?modules=summaryDetail%2CdefaultKeyStatistics`;
-  const res = await fetch(url, { headers: HEADERS }).catch(() => null);
-  if (!res?.ok) return { trailingPE: null, forwardPE: null };
-
-  const data = await res.json().catch(() => null);
-  const detail = data?.quoteSummary?.result?.[0];
-  const trailingPE = detail?.summaryDetail?.trailingPE?.raw ?? null;
-  const forwardPE = detail?.summaryDetail?.forwardPE?.raw ?? null;
-  return { trailingPE, forwardPE };
+// PER: v7 quote API로 ETF 심볼 조회 (더 안정적)
+async function fetchAllPE(peSymbols) {
+  try {
+    const symbolStr = peSymbols.join("%2C");
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbolStr}&fields=trailingPE%2CforwardPE`;
+    const res = await fetch(url, { headers: HEADERS });
+    if (!res.ok) return {};
+    const data = await res.json();
+    const quotes = data?.quoteResponse?.result ?? [];
+    const peMap = {};
+    for (const q of quotes) {
+      peMap[q.symbol] = {
+        trailingPE: q.trailingPE ?? null,
+        forwardPE: q.forwardPE ?? null,
+      };
+    }
+    return peMap;
+  } catch {
+    return {};
+  }
 }
 
 function getSignal(pe, ranges) {
@@ -99,32 +104,20 @@ function getBarPosition(pe, ranges) {
 }
 
 export async function GET() {
+  // PE는 한 번에 일괄 조회 (API 호출 최소화)
+  const peSymbols = INDICES.map((i) => i.peSymbol);
+  const peMap = await fetchAllPE(peSymbols);
+
   const results = await Promise.all(
     INDICES.map(async (index) => {
       try {
-        const [priceData, peData] = await Promise.all([
-          fetchPrice(index.symbol),
-          fetchPE(index.peSymbol),
-        ]);
-
-        const { price, changePercent } = priceData;
-        const { trailingPE, forwardPE } = peData;
-
+        const { price, changePercent } = await fetchPrice(index.symbol);
+        const { trailingPE, forwardPE } = peMap[index.peSymbol] ?? {};
         const pe = trailingPE && trailingPE > 0 ? trailingPE : (forwardPE && forwardPE > 0 ? forwardPE : null);
         const peType = trailingPE && trailingPE > 0 ? "trailing" : (forwardPE ? "forward" : null);
-
         const signal = getSignal(pe, index.ranges);
         const barPos = pe ? getBarPosition(pe, index.ranges) : null;
-
-        return {
-          ...index,
-          price,
-          changePercent,
-          pe,
-          peType,
-          signal,
-          barPos,
-        };
+        return { ...index, price, changePercent, pe, peType, signal, barPos };
       } catch (err) {
         return {
           ...index,
@@ -137,16 +130,22 @@ export async function GET() {
     })
   );
 
+  // 중복 제거 (id 기준)
+  const seen = new Set();
+  const deduped = results.filter((r) => {
+    if (seen.has(r.id)) return false;
+    seen.add(r.id);
+    return true;
+  });
+
   return Response.json(
     {
-      data: results,
+      data: deduped,
       updatedAt: new Date().toISOString(),
       note: "PER 출처: SPY(S&P500), QQQ(나스닥), EWY(한국), ASHR(중국) ETF 기준",
     },
     {
-      headers: {
-        "Cache-Control": "s-maxage=3600, stale-while-revalidate=7200",
-      },
+      headers: { "Cache-Control": "s-maxage=3600, stale-while-revalidate=7200" },
     }
   );
 }
